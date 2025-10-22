@@ -1,19 +1,17 @@
 from django.shortcuts import get_object_or_404
 from rest_framework.views import APIView
 from rest_framework.response import Response
-from rest_framework import status, generics
+from rest_framework import status
+from rest_framework.generics import ListAPIView
+from rest_framework.pagination import PageNumberPagination
 from django.db import IntegrityError
 from .models import AnalyzedString
 from .serializers import CreateStringSerializer, AnalyzedStringSerializer
 from .utils import analyse_string
-from rest_framework.generics import ListAPIView
-from rest_framework.pagination import PageNumberPagination
 import hashlib
 
 
-# ------------------------------
-# CREATE /strings (POST)
-# ------------------------------
+# POST /strings/
 class CreateStringView(APIView):
     def post(self, request):
         serializer = CreateStringSerializer(data=request.data)
@@ -34,15 +32,13 @@ class CreateStringView(APIView):
         return Response(AnalyzedStringSerializer(obj).data, status=status.HTTP_201_CREATED)
 
 
-# ------------------------------
-# LIST /strings (GET)
-# ------------------------------
+# GET /strings
 class StringListView(ListAPIView):
     serializer_class = AnalyzedStringSerializer
     pagination_class = PageNumberPagination
 
     def get_queryset(self):
-        qs = AnalyzedString.objects.all()
+        queryset = AnalyzedString.objects.all()
         params = self.request.query_params
 
         is_palindrome = params.get("is_palindrome")
@@ -51,43 +47,83 @@ class StringListView(ListAPIView):
         word_count = params.get("word_count")
         contains_character = params.get("contains_character")
 
-        if is_palindrome:
+        if is_palindrome is not None:
             val = is_palindrome.lower() == "true"
-            qs = [o for o in qs if o.properties.get("is_palindrome") == val]
+            queryset = queryset.filter(properties__is_palindrome=val)
 
-        if min_length:
-            qs = [o for o in qs if o.properties.get("length") >= int(min_length)]
+        if min_length is not None:
+            queryset = queryset.filter(properties__length__gte=int(min_length))
 
-        if max_length:
-            qs = [o for o in qs if o.properties.get("length") <= int(max_length)]
+        if max_length is not None:
+            queryset = queryset.filter(properties__length__lte=int(max_length))
 
-        if word_count:
-            qs = [o for o in qs if o.properties.get("word_count") == int(word_count)]
+        if word_count is not None:
+            queryset = queryset.filter(properties__word_count=int(word_count))
 
         if contains_character:
             if len(contains_character) != 1:
-                raise ValueError("contains_character must be a single character")
-            qs = [o for o in qs if contains_character in o.properties.get("character_frequency_map", {})]
+                return AnalyzedString.objects.none()
+            queryset = queryset.filter(
+                **{f"properties__character_frequency_map__has_key": contains_character}
+            )
 
-        ids = [o.id for o in qs]
-        from django.db.models import Case, When
-        preserved = Case(*[When(pk=pk, then=pos) for pos, pk in enumerate(ids)])
-        return AnalyzedString.objects.filter(pk__in=ids).order_by("-created_at")
+        return queryset.order_by("-created_at")
+
+
+# GET /strings/{string_value}
+class RetrieveStringView(APIView):
+    def get(self, request, string_value):
+        sha = hashlib.sha256(string_value.encode("utf-8")).hexdigest()
+        obj = AnalyzedString.objects.filter(id=sha).first()
+        if not obj:
+            return Response({"detail": "String not found"}, status=status.HTTP_404_NOT_FOUND)
+        return Response(AnalyzedStringSerializer(obj).data, status=status.HTTP_200_OK)
 
 
 # DELETE /strings/{string_value}
-
 class DeleteStringView(APIView):
     def delete(self, request, string_value):
         sha = hashlib.sha256(string_value.encode("utf-8")).hexdigest()
-
-        try:
-            obj = AnalyzedString.objects.get(pk=sha)
-        except AnalyzedString.DoesNotExist:
-            return Response(
-                {"detail": "String does not exist in the system"},
-                status=status.HTTP_404_NOT_FOUND
-            )
-
+        obj = AnalyzedString.objects.filter(id=sha).first()
+        if not obj:
+            return Response({"detail": "String does not exist in the system"}, status=status.HTTP_404_NOT_FOUND)
         obj.delete()
         return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+# GET /strings/filter-by-natural-language
+class NaturalLanguageFilterView(APIView):
+    def get(self, request):
+        query = request.query_params.get("query", "").lower()
+        queryset = AnalyzedString.objects.all()
+
+        if "palindrome" in query:
+            if "not" in query:
+                queryset = queryset.filter(properties__is_palindrome=False)
+            else:
+                queryset = queryset.filter(properties__is_palindrome=True)
+
+        if "longer than" in query:
+            import re
+            match = re.search(r"longer than (\d+)", query)
+            if match:
+                length = int(match.group(1))
+                queryset = queryset.filter(properties__length__gt=length)
+
+        if "shorter than" in query:
+            import re
+            match = re.search(r"shorter than (\d+)", query)
+            if match:
+                length = int(match.group(1))
+                queryset = queryset.filter(properties__length__lt=length)
+
+        if "contain" in query:
+            import re
+            match = re.search(r"contain[s]? (.)", query)
+            if match:
+                char = match.group(1)
+                queryset = queryset.filter(
+                    **{f"properties__character_frequency_map__has_key": char}
+                )
+
+        return Response(AnalyzedStringSerializer(queryset, many=True).data, status=status.HTTP_200_OK)
